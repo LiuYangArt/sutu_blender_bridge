@@ -12,14 +12,14 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 bl_info = {
-    "name": "ADDON_NAME",
-    "author": "AUTHOR_NAME",
-    "description": "",
-    "blender": (2, 80, 0),
-    "version": (0, 0, 1),
-    "location": "",
+    "name": "Sutu Blender Bridge",
+    "author": "LiuYang",
+    "description": "Bridge V2 companion for streaming Blender viewport to Sutu",
+    "blender": (4, 2, 0),
+    "version": (0, 2, 0),
+    "location": "View3D > Sidebar > Sutu > Bridge",
     "warning": "",
-    "category": "Generic",
+    "category": "3D View",
 }
 
 from . import auto_load

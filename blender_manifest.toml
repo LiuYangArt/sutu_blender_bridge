@@ -3,9 +3,9 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "sutu_blender_bridge"
-version = "1.0.0"
-name = "Sutu-blender"
-tagline = "This is another extension"
+version = "0.2.0"
+name = "Sutu Blender Bridge"
+tagline = "Bridge V2 companion for streaming Blender viewport to Sutu"
 maintainer = "LiuYang"
 # Supported types: "add-on", "theme"
 type = "add-on"
@@ -15,7 +15,7 @@ type = "add-on"
 
 # Optional list defined by Blender and server, see:
 # https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
-tags = ["Animation", "Sequencer"]
+tags = ["Animation", "Import-Export"]
 
 blender_version_min = "4.2.0"
 # # Optional: Blender version that the extension does not support, earlier versions are supported.
@@ -58,10 +58,8 @@ license = [
 # Keep this a single short sentence without a period (.) at the end.
 # For longer explanations use the documentation or detail page.
 #
-# [permissions]
-# network = "Need to sync motion-capture data to server"
-# files = "Import/export FBX from/to disk"
-# clipboard = "Copy and paste bone transforms"
+[permissions]
+network = "Need localhost TCP socket to connect with Sutu Bridge runtime"
 
 # Optional: build settings.
 # https://docs.blender.org/manual/en/dev/advanced/extensions/command_line_arguments.html#command-line-args-extension-build
