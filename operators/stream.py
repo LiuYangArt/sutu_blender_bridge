@@ -4,6 +4,10 @@ import time
 
 import bpy
 import gpu
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - Blender runtime dependency
+    np = None
 
 from ..bridge.client import get_bridge_client
 from ..bridge.frame_sender import get_frame_sender, shutdown_frame_sender
@@ -19,6 +23,17 @@ _LAST_DIRTY_AT = 0.0
 _PENDING_CAPTURE = False
 _LAST_VIEW_SIGNATURE = None
 _DEPSGRAPH_HANDLER = None
+_CAPTURE_COLOR_SLOT = None
+_OFFSCREEN = None
+_OFFSCREEN_SIZE = (0, 0)
+_CAPTURE_BACKEND = None
+_OFFSCREEN_LAYOUT_LOGGED = False
+
+
+def _as_optional_int(value):
+    if value is None:
+        return None
+    return int(value)
 
 
 def _iter_view3d_window_regions():
@@ -170,18 +185,265 @@ def _capture_draw_callback():
     if width <= 0 or height <= 0:
         return
 
-    frame_buffer = gpu.state.active_framebuffer_get()
-    if frame_buffer is None:
-        return
-
     try:
-        rgba_buffer = frame_buffer.read_color(0, 0, width, height, 4, 0, "UBYTE")
-        sender.send_rgba_frame(width=width, height=height, pixels=bytes(rgba_buffer))
+        pixels = _capture_with_offscreen(width, height)
+        if pixels is None:
+            frame_buffer = gpu.state.active_framebuffer_get()
+            if frame_buffer is None:
+                return
+            pixels = _capture_best_color_bytes(frame_buffer, width, height)
+        if pixels is None:
+            return
+        sender.send_rgba_frame(width=width, height=height, pixels=pixels)
         _LAST_CAPTURE_AT = time.monotonic()
         _PENDING_CAPTURE = False
     except Exception as exc:
         _PENDING_CAPTURE = False
         print(f"[SutuBridge] 采集视口帧失败: {exc}")
+
+
+def _ensure_offscreen(width: int, height: int):
+    global _OFFSCREEN, _OFFSCREEN_SIZE
+    if width <= 0 or height <= 0:
+        return None
+    if _OFFSCREEN is not None and _OFFSCREEN_SIZE == (width, height):
+        return _OFFSCREEN
+    _free_offscreen()
+    try:
+        _OFFSCREEN = gpu.types.GPUOffScreen(width, height, format="RGBA8")
+        _OFFSCREEN_SIZE = (width, height)
+        return _OFFSCREEN
+    except Exception as exc:
+        print(f"[SutuBridge] 创建 offscreen 失败: {exc}")
+        _OFFSCREEN = None
+        _OFFSCREEN_SIZE = (0, 0)
+        return None
+
+
+def _free_offscreen() -> None:
+    global _OFFSCREEN, _OFFSCREEN_SIZE
+    offscreen = _OFFSCREEN
+    _OFFSCREEN = None
+    _OFFSCREEN_SIZE = (0, 0)
+    if offscreen is None:
+        return
+    try:
+        offscreen.free()
+    except Exception:
+        pass
+
+
+def _capture_with_offscreen(width: int, height: int):
+    global _CAPTURE_BACKEND
+
+    context = bpy.context
+    space = getattr(context, "space_data", None)
+    region = getattr(context, "region", None)
+    region_data = getattr(context, "region_data", None)
+    if (
+        space is None
+        or region is None
+        or region_data is None
+        or getattr(space, "type", "") != "VIEW_3D"
+        or getattr(region, "type", "") != "WINDOW"
+    ):
+        return None
+
+    projection_matrix = getattr(region_data, "window_matrix", None)
+    if projection_matrix is None:
+        projection_matrix = getattr(region_data, "perspective_matrix", None)
+    view_matrix = getattr(region_data, "view_matrix", None)
+    if projection_matrix is None or view_matrix is None:
+        return None
+
+    offscreen = _ensure_offscreen(width, height)
+    if offscreen is None:
+        return None
+
+    try:
+        offscreen.draw_view3d(
+            context.scene,
+            context.view_layer,
+            space,
+            region,
+            view_matrix.copy(),
+            projection_matrix.copy(),
+            do_color_management=True,
+        )
+        texture_data = offscreen.texture_color.read()
+        pixels = _pack_offscreen_texture_to_bytes(texture_data, width, height)
+    except Exception as exc:
+        print(f"[SutuBridge] offscreen 采集失败: {exc}")
+        return None
+
+    if pixels is None:
+        return None
+
+    if _CAPTURE_BACKEND != "offscreen":
+        _CAPTURE_BACKEND = "offscreen"
+        print("[SutuBridge] 采集后端: offscreen")
+    return pixels
+
+
+def _pack_offscreen_texture_to_bytes(texture_data, width: int, height: int):
+    global _OFFSCREEN_LAYOUT_LOGGED
+
+    expected_len = width * height * 4
+    if expected_len <= 0:
+        return None
+
+    if np is not None:
+        try:
+            arr = _reshape_offscreen_array(texture_data, width, height, expected_len)
+            if arr is None:
+                return None
+
+            # Match BlenderLayer's send pipeline: Fortran flatten + reshape + vertical flip.
+            packed = (
+                np.array(arr, copy=False, dtype=np.uint8)
+                .ravel(order="F")
+                .reshape(height, width, 4)[::-1, :, :4]
+            )
+            packed = _fix_suspicious_rgab_layout(packed, width, height)
+
+            # Bridge viewport is expected as a normal paint layer snapshot (opaque).
+            packed[:, :, 3] = 255
+            if not _OFFSCREEN_LAYOUT_LOGGED:
+                print(f"[SutuBridge] offscreen buffer shape={tuple(arr.shape)} np_pack=fortran_flip")
+                _OFFSCREEN_LAYOUT_LOGGED = True
+            return packed.tobytes()
+        except Exception:
+            pass
+
+    try:
+        raw = bytes(texture_data)
+    except Exception:
+        return None
+    if len(raw) < expected_len:
+        return None
+    flipped = bytearray(_flip_rgba_rows(raw[:expected_len], width, height))
+    flipped[3::4] = b"\xff" * (len(flipped) // 4)
+    return bytes(flipped)
+
+
+def _reshape_offscreen_array(texture_data, width: int, height: int, expected_len: int):
+    if np is None:
+        return None
+
+    arr = np.array(texture_data, copy=False, dtype=np.uint8)
+    if arr.size < expected_len:
+        return None
+    if arr.ndim == 1:
+        return arr[:expected_len].reshape(height, width, 4)
+    if arr.ndim == 2 and arr.shape[1] == 4:
+        return arr[: width * height, :].reshape(height, width, 4)
+    if arr.ndim >= 3:
+        arr = arr[:height, :width, :4]
+        if arr.shape[0] != height or arr.shape[1] != width or arr.shape[2] < 4:
+            return None
+        return arr
+    return None
+
+
+def _fix_suspicious_rgab_layout(packed, width: int, height: int):
+    if np is None:
+        return packed
+
+    # Some Blender/GPU combinations expose offscreen channels as RGAB-like layout.
+    # Detect the suspicious signature and swap to RGBA.
+    sample = packed[:: max(1, height // 256), :: max(1, width // 256), :]
+    alpha_mean = float(sample[:, :, 3].mean())
+    ch2_mean = float(sample[:, :, 2].mean())
+    if alpha_mean < 96.0 and ch2_mean > 200.0:
+        print("[SutuBridge] offscreen 检测到通道异常，已应用 RGAB->RGBA 修正")
+        return packed[:, :, [0, 1, 3, 2]]
+    return packed
+
+
+def _flip_rgba_rows(pixels: bytes, width: int, height: int) -> bytes:
+    row_bytes = width * 4
+    if row_bytes <= 0 or height <= 0:
+        return pixels
+    flipped = bytearray(len(pixels))
+    for y in range(height):
+        src_start = (height - 1 - y) * row_bytes
+        dst_start = y * row_bytes
+        flipped[dst_start : dst_start + row_bytes] = pixels[src_start : src_start + row_bytes]
+    return bytes(flipped)
+
+
+def _read_color_bytes(frame_buffer, width: int, height: int, slot: int):
+    try:
+        rgba_buffer = frame_buffer.read_color(0, 0, width, height, 4, slot, "UBYTE")
+        data = bytes(rgba_buffer)
+        if len(data) != width * height * 4:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _estimate_signal_score(pixels: bytes) -> float:
+    total_pixels = len(pixels) // 4
+    if total_pixels <= 0:
+        return 0.0
+
+    sample_count = min(8192, total_pixels)
+    step = max(1, total_pixels // sample_count)
+    sampled = 0
+    non_zero_rgb = 0
+    rgb_sum = 0
+    for pixel_index in range(0, total_pixels, step):
+        i = pixel_index * 4
+        r = pixels[i]
+        g = pixels[i + 1]
+        b = pixels[i + 2]
+        rgb_sum += r + g + b
+        if r != 0 or g != 0 or b != 0:
+            non_zero_rgb += 1
+        sampled += 1
+        if sampled >= sample_count:
+            break
+
+    if sampled <= 0:
+        return 0.0
+    non_zero_ratio = non_zero_rgb / sampled
+    mean_rgb = rgb_sum / (sampled * 3 * 255.0)
+    return non_zero_ratio * 0.8 + mean_rgb * 0.2
+
+
+def _capture_best_color_bytes(frame_buffer, width: int, height: int):
+    global _CAPTURE_COLOR_SLOT, _CAPTURE_BACKEND
+
+    if _CAPTURE_COLOR_SLOT is not None:
+        cached_slot = _as_optional_int(_CAPTURE_COLOR_SLOT)
+        cached = _read_color_bytes(frame_buffer, width, height, cached_slot) if cached_slot is not None else None
+        if cached is not None:
+            return cached
+        _CAPTURE_COLOR_SLOT = None
+
+    best_slot = None
+    best_pixels = None
+    best_score = -1.0
+    for slot in (0, 1, 2, 3):
+        pixels = _read_color_bytes(frame_buffer, width, height, slot)
+        if pixels is None:
+            continue
+        score = _estimate_signal_score(pixels)
+        if score > best_score:
+            best_score = score
+            best_slot = slot
+            best_pixels = pixels
+
+    if best_pixels is None:
+        return None
+    if _CAPTURE_COLOR_SLOT != best_slot:
+        _CAPTURE_COLOR_SLOT = best_slot
+        print(f"[SutuBridge] 采集颜色附件 slot={best_slot}, signal_score={best_score:.4f}")
+    if _CAPTURE_BACKEND != "active_framebuffer":
+        _CAPTURE_BACKEND = "active_framebuffer"
+        print("[SutuBridge] 采集后端: active_framebuffer")
+    return best_pixels
 
 
 def _ensure_stream_hooks() -> None:
@@ -216,14 +478,25 @@ def _remove_stream_hooks() -> None:
         _DEPSGRAPH_HANDLER = None
     if bpy.app.timers.is_registered(_stream_state_timer):
         bpy.app.timers.unregister(_stream_state_timer)
+    _free_offscreen()
 
 
 def _reset_stream_state() -> None:
-    global _LAST_CAPTURE_AT, _LAST_DIRTY_AT, _PENDING_CAPTURE, _LAST_VIEW_SIGNATURE
+    global _LAST_CAPTURE_AT
+    global _LAST_DIRTY_AT
+    global _PENDING_CAPTURE
+    global _LAST_VIEW_SIGNATURE
+    global _CAPTURE_COLOR_SLOT
+    global _CAPTURE_BACKEND
+    global _OFFSCREEN_LAYOUT_LOGGED
     _LAST_CAPTURE_AT = 0.0
     _LAST_DIRTY_AT = 0.0
     _PENDING_CAPTURE = False
     _LAST_VIEW_SIGNATURE = None
+    _CAPTURE_COLOR_SLOT = None
+    _CAPTURE_BACKEND = None
+    _OFFSCREEN_LAYOUT_LOGGED = False
+    _free_offscreen()
 
 
 class SUTU_OT_bridge_start_stream(bpy.types.Operator):

@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 import bpy
 
+from .debug_dump import get_bridge_debug_dumper
 from .framing import FrameDecoder, FrameError, encode_frame
 from .messages import (
     BRIDGE_MODE_AUTO,
@@ -46,6 +47,7 @@ else:
     ADDON_ID = _PACKAGE_NAME
 ADDON_SHORT_ID = ADDON_ID.rsplit(".", 1)[-1]
 RECONNECT_BACKOFF_SEC = (0.5, 1.0, 2.0, 5.0)
+MAX_BINARY_FRAME_BYTES = 128 * 1024 * 1024
 
 
 @dataclass
@@ -85,6 +87,7 @@ class BridgeClient:
         self._client_name = "sutu_blender_bridge"
         self._client_version = "0.2.0"
         self._capabilities = ["shm_ring", "tcp_lz4", "chunked_frame"]
+        self._debug_dumper = get_bridge_debug_dumper()
 
     @property
     def port(self) -> int:
@@ -168,8 +171,18 @@ class BridgeClient:
         if frame_id is not None:
             self._register_inflight_frame(frame_id)
 
-    def enqueue_binary_chunk(self, payload: bytes) -> None:
-        framed = encode_frame(payload, MAX_CONTROL_MESSAGE_BYTES * 16)
+    def enqueue_binary_chunk(self, payload: bytes, frame_id: Optional[int] = None) -> None:
+        framed = encode_frame(payload, MAX_BINARY_FRAME_BYTES)
+        if frame_id is not None and frame_id > 0:
+            self._debug_dumper.dump_frame_bytes(
+                frame_id=frame_id,
+                stage="tcp_framed",
+                payload=framed,
+                meta={
+                    "payloadBytes": int(len(payload)),
+                    "framedBytes": int(len(framed)),
+                },
+            )
         self._enqueue_frame_bytes(framed)
 
     def _enqueue_frame_bytes(self, framed: bytes) -> None:
@@ -305,7 +318,7 @@ class BridgeClient:
         if selected_transport not in (BRIDGE_TRANSPORT_SHM, BRIDGE_TRANSPORT_TCP_LZ4):
             raise BridgeClientError(E_PROTO_MISMATCH, f"未知传输模式: {selected_transport}")
 
-        degraded = selected_transport == BRIDGE_TRANSPORT_TCP_LZ4 and ("shm_ring" in self._capabilities)
+        degraded = False
         with self._state_lock:
             self._session_counter += 1
             self._active_session_id = self._session_counter

@@ -45,6 +45,18 @@ def _on_bridge_enable_updated(self, context: Optional[bpy.types.Context]) -> Non
         get_bridge_client().disable_connection()
 
 
+def _draw_debug_options(layout, prefs) -> None:
+    layout.separator()
+    layout.prop(prefs, "auto_install_lz4")
+    layout.prop(prefs, "dump_frame_files")
+    row = layout.row()
+    row.enabled = bool(getattr(prefs, "dump_frame_files", False))
+    row.prop(prefs, "dump_max_frames")
+    row = layout.row()
+    row.enabled = bool(getattr(prefs, "dump_frame_files", False))
+    row.prop(prefs, "dump_directory")
+
+
 class SUTUBridgeAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
@@ -75,11 +87,39 @@ class SUTUBridgeAddonPreferences(bpy.types.AddonPreferences):
         update=_on_bridge_enable_updated,
     )
 
+    auto_install_lz4: bpy.props.BoolProperty(  # type: ignore
+        name="Auto Install LZ4",
+        description="缺少 lz4 时尝试自动安装；失败会自动退化为原始字节发送",
+        default=True,
+    )
+
+    dump_frame_files: bpy.props.BoolProperty(  # type: ignore
+        name="Dump Frame Files",
+        description="导出采集帧与传输字节到文件，便于排查编码/解码问题",
+        default=False,
+    )
+
+    dump_max_frames: bpy.props.IntProperty(  # type: ignore
+        name="Dump Max Frames",
+        description="每次推流会话最多导出的帧数",
+        default=3,
+        min=1,
+        max=30,
+    )
+
+    dump_directory: bpy.props.StringProperty(  # type: ignore
+        name="Dump Directory",
+        description="调试文件输出目录，留空时使用系统临时目录",
+        default="",
+        subtype="DIR_PATH",
+    )
+
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         layout.prop(self, "link_mode")
         layout.prop(self, "port")
         layout.prop(self, "enable_connection")
+        _draw_debug_options(layout, self)
 
 
 class SUTU_PT_bridge_panel(bpy.types.Panel):
@@ -99,6 +139,7 @@ class SUTU_PT_bridge_panel(bpy.types.Panel):
         layout.prop(prefs, "link_mode")
         layout.prop(prefs, "port")
         layout.prop(prefs, "enable_connection")
+        _draw_debug_options(layout, prefs)
 
         status = get_bridge_client().get_status()
         status_row = layout.column(align=True)
