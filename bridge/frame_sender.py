@@ -90,8 +90,7 @@ class FrameSender:
                     shm_slot=slot,
                     chunk_size=None,
                     timestamp_ms=ts_ms,
-                ),
-                frame_id=frame_id,
+                )
             )
             return frame_id
 
@@ -106,8 +105,7 @@ class FrameSender:
                 shm_slot=None,
                 chunk_size=len(compressed),
                 timestamp_ms=ts_ms,
-            ),
-            frame_id=frame_id,
+            )
         )
         self._client.enqueue_binary_chunk(compressed)
         return frame_id

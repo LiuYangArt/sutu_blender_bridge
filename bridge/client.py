@@ -275,7 +275,15 @@ class BridgeClient:
     def _run_session(self, config: BridgeClientConfig) -> None:
         self._set_state("handshaking")
         decoder = FrameDecoder(MAX_CONTROL_MESSAGE_BYTES)
-        sock = socket.create_connection(("127.0.0.1", config.port), timeout=2.0)
+        try:
+            sock = socket.create_connection(("127.0.0.1", config.port), timeout=2.0)
+        except TimeoutError as exc:
+            raise BridgeClientError(
+                E_SOCKET_IO,
+                f"连接 Sutu 超时，请确认 Sutu 已启动并监听端口 {config.port}",
+            ) from exc
+        except OSError as exc:
+            raise BridgeClientError(E_SOCKET_IO, f"连接 Sutu 失败: {exc}") from exc
         sock.settimeout(0.05)
         self._set_socket(sock)
         self._clear_error()

@@ -24,6 +24,8 @@ def _apply_bridge_preferences(context: Optional[bpy.types.Context], connect_now:
         enable_connection=bool(getattr(prefs, "enable_connection", False)),
     )
     if not ok:
+        if bool(getattr(prefs, "enable_connection", False)):
+            prefs.enable_connection = False
         return
     if bool(getattr(prefs, "enable_connection", False)) and connect_now:
         client.request_connect()

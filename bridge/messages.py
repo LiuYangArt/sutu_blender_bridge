@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, Optional
 try:
     import msgpack  # type: ignore
 except Exception:  # pragma: no cover - Blender runtime dependency
-    msgpack = None
+    from . import msgpack_compat as msgpack
 
 PROTOCOL_MAGIC = "SUTU_BRIDGE_V2"
 PROTOCOL_VERSION = 2
@@ -43,6 +43,112 @@ E_HEARTBEAT_TIMEOUT = "E_HEARTBEAT_TIMEOUT"
 E_STOP_REQUESTED = "E_STOP_REQUESTED"
 
 ControlMessage = Dict[str, Any]
+_CONTROL_MESSAGE_TYPES = (
+    MESSAGE_TYPE_HELLO,
+    MESSAGE_TYPE_HELLO_ACK,
+    MESSAGE_TYPE_START_STREAM,
+    MESSAGE_TYPE_STOP_STREAM,
+    MESSAGE_TYPE_FRAME_META,
+    MESSAGE_TYPE_ACK,
+    MESSAGE_TYPE_ERROR,
+    MESSAGE_TYPE_HEARTBEAT,
+)
+_CONTROL_MESSAGE_TYPE_SET = set(_CONTROL_MESSAGE_TYPES)
+_CONTROL_MESSAGE_INDEX_TO_TYPE = {idx: name for idx, name in enumerate(_CONTROL_MESSAGE_TYPES)}
+_PAYLOAD_FIELDS_BY_TYPE = {
+    MESSAGE_TYPE_HELLO: ("magic", "protocolVersion", "capabilities", "clientName", "clientVersion"),
+    MESSAGE_TYPE_HELLO_ACK: ("accepted", "serverVersion", "selectedTransport", "reason"),
+    MESSAGE_TYPE_START_STREAM: ("streamId",),
+    MESSAGE_TYPE_STOP_STREAM: ("reason",),
+    MESSAGE_TYPE_FRAME_META: (
+        "frameId",
+        "width",
+        "height",
+        "stride",
+        "pixelFormat",
+        "transport",
+        "shmSlot",
+        "chunkSize",
+        "timestampMs",
+    ),
+    MESSAGE_TYPE_ACK: ("frameId",),
+    MESSAGE_TYPE_ERROR: ("code", "message"),
+    MESSAGE_TYPE_HEARTBEAT: ("timestampMs",),
+}
+
+
+def _type_from_compact(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        return normalized if normalized in _CONTROL_MESSAGE_TYPE_SET else None
+    if isinstance(value, int):
+        return _CONTROL_MESSAGE_INDEX_TO_TYPE.get(int(value))
+    return None
+
+
+def _normalize_transport_value(value: Any) -> Any:
+    if isinstance(value, str):
+        if value in (BRIDGE_TRANSPORT_SHM, BRIDGE_TRANSPORT_TCP_LZ4):
+            return value
+        lowered = value.strip().lower()
+        if lowered in {"shm", "shared_memory", "shared-memory"}:
+            return BRIDGE_TRANSPORT_SHM
+        if lowered in {"tcp_lz4", "tcp-lz4", "tcplz4"}:
+            return BRIDGE_TRANSPORT_TCP_LZ4
+        return value
+    if isinstance(value, int):
+        if value == 0:
+            return BRIDGE_TRANSPORT_SHM
+        if value == 1:
+            return BRIDGE_TRANSPORT_TCP_LZ4
+    return value
+
+
+def _normalize_payload(message_type: str, payload: Any) -> Dict[str, Any]:
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        normalized = dict(payload)
+    elif isinstance(payload, (list, tuple)):
+        field_names = _PAYLOAD_FIELDS_BY_TYPE.get(message_type)
+        if field_names is None:
+            raise BridgeProtocolError(E_PROTO_MISMATCH, "未知消息类型，无法解析 payload")
+        normalized = {}
+        for idx, field_name in enumerate(field_names):
+            if idx < len(payload):
+                normalized[field_name] = payload[idx]
+    else:
+        raise BridgeProtocolError(E_PROTO_MISMATCH, "消息 payload 不是对象")
+
+    if message_type == MESSAGE_TYPE_HELLO_ACK:
+        normalized["selectedTransport"] = _normalize_transport_value(normalized.get("selectedTransport"))
+    elif message_type == MESSAGE_TYPE_FRAME_META:
+        normalized["transport"] = _normalize_transport_value(normalized.get("transport"))
+    return normalized
+
+
+def _normalize_control_message(message: Any) -> ControlMessage:
+    if isinstance(message, dict):
+        if "type" in message:
+            message_type = _type_from_compact(message.get("type"))
+            if message_type is None:
+                raise BridgeProtocolError(E_PROTO_MISMATCH, "消息类型不受支持")
+            payload = _normalize_payload(message_type, message.get("payload"))
+            return {"type": message_type, "payload": payload}
+        if len(message) == 1:
+            variant_key = next(iter(message.keys()))
+            message_type = _type_from_compact(variant_key)
+            if message_type is not None:
+                payload = _normalize_payload(message_type, message.get(variant_key))
+                return {"type": message_type, "payload": payload}
+
+    if isinstance(message, (list, tuple)) and len(message) == 2:
+        message_type = _type_from_compact(message[0])
+        if message_type is not None:
+            payload = _normalize_payload(message_type, message[1])
+            return {"type": message_type, "payload": payload}
+
+    raise BridgeProtocolError(E_PROTO_MISMATCH, "控制消息结构无效")
 
 
 class BridgeProtocolError(RuntimeError):
@@ -56,11 +162,6 @@ def now_millis() -> int:
 
 
 def _require_msgpack():
-    if msgpack is None:
-        raise BridgeProtocolError(
-            E_PROTO_MISMATCH,
-            "msgpack 依赖缺失，无法使用 Bridge V2 协议编码",
-        )
     return msgpack
 
 
@@ -90,9 +191,7 @@ def decode_control_message(payload: bytes) -> ControlMessage:
             E_PROTO_MISMATCH,
             f"控制消息解码失败: {exc}",
         ) from exc
-    if not isinstance(message, dict) or "type" not in message:
-        raise BridgeProtocolError(E_PROTO_MISMATCH, "控制消息结构无效")
-    return message
+    return _normalize_control_message(message)
 
 
 def expect_message_type(message: ControlMessage, expected_type: str) -> Dict[str, Any]:

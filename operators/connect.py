@@ -31,6 +31,7 @@ class SUTU_OT_bridge_connect_toggle(bpy.types.Operator):
             enable_connection=True,
         )
         if not ok:
+            prefs.enable_connection = False
             last_error = client.get_status().get("last_error")
             if isinstance(last_error, dict):
                 self.report({"ERROR"}, str(last_error.get("message") or "连接配置失败"))
