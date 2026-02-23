@@ -261,14 +261,13 @@ def _capture_with_offscreen(width: int, height: int):
         return None
 
     try:
-        offscreen.draw_view3d(
-            context.scene,
-            context.view_layer,
-            space,
-            region,
-            view_matrix.copy(),
-            projection_matrix.copy(),
-            do_color_management=True,
+        _draw_offscreen_view3d(
+            offscreen=offscreen,
+            context=context,
+            space=space,
+            region=region,
+            view_matrix=view_matrix.copy(),
+            projection_matrix=projection_matrix.copy(),
         )
         texture_data = offscreen.texture_color.read()
         pixels = _pack_offscreen_texture_to_bytes(texture_data, width, height)
@@ -283,6 +282,47 @@ def _capture_with_offscreen(width: int, height: int):
         _CAPTURE_BACKEND = "offscreen"
         print("[SutuBridge] 采集后端: offscreen")
     return pixels
+
+
+def _is_film_transparent_enabled(context) -> bool:
+    scene = getattr(context, "scene", None)
+    render = getattr(scene, "render", None)
+    return bool(getattr(render, "film_transparent", False))
+
+
+def _draw_offscreen_view3d(
+    offscreen,
+    context,
+    space,
+    region,
+    view_matrix,
+    projection_matrix,
+) -> None:
+    if _is_film_transparent_enabled(context):
+        try:
+            offscreen.draw_view3d(
+                context.scene,
+                context.view_layer,
+                space,
+                region,
+                view_matrix,
+                projection_matrix,
+                do_color_management=True,
+                draw_background=False,
+            )
+            return
+        except TypeError:
+            pass
+
+    offscreen.draw_view3d(
+        context.scene,
+        context.view_layer,
+        space,
+        region,
+        view_matrix,
+        projection_matrix,
+        do_color_management=True,
+    )
 
 
 def _pack_offscreen_texture_to_bytes(texture_data, width: int, height: int):
@@ -306,8 +346,6 @@ def _pack_offscreen_texture_to_bytes(texture_data, width: int, height: int):
             )
             packed = _fix_suspicious_rgab_layout(packed, width, height)
 
-            # Bridge viewport is expected as a normal paint layer snapshot (opaque).
-            packed[:, :, 3] = 255
             if not _OFFSCREEN_LAYOUT_LOGGED:
                 print(f"[SutuBridge] offscreen buffer shape={tuple(arr.shape)} np_pack=fortran_flip")
                 _OFFSCREEN_LAYOUT_LOGGED = True
@@ -321,9 +359,7 @@ def _pack_offscreen_texture_to_bytes(texture_data, width: int, height: int):
         return None
     if len(raw) < expected_len:
         return None
-    flipped = bytearray(_flip_rgba_rows(raw[:expected_len], width, height))
-    flipped[3::4] = b"\xff" * (len(flipped) // 4)
-    return bytes(flipped)
+    return _flip_rgba_rows(raw[:expected_len], width, height)
 
 
 def _reshape_offscreen_array(texture_data, width: int, height: int, expected_len: int):
