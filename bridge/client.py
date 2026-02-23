@@ -39,7 +39,12 @@ from .messages import (
     parse_hello_ack,
 )
 
-ADDON_ID = (__package__ or "sutu_blender_bridge").split(".")[0]
+_PACKAGE_NAME = __package__ or "sutu_blender_bridge.bridge"
+if _PACKAGE_NAME.endswith(".bridge"):
+    ADDON_ID = _PACKAGE_NAME.rsplit(".", 1)[0]
+else:
+    ADDON_ID = _PACKAGE_NAME
+ADDON_SHORT_ID = ADDON_ID.rsplit(".", 1)[-1]
 RECONNECT_BACKOFF_SEC = (0.5, 1.0, 2.0, 5.0)
 
 
@@ -494,10 +499,18 @@ def get_addon_preferences(context: Optional[bpy.types.Context] = None):
     addons = getattr(getattr(ctx, "preferences", None), "addons", None)
     if addons is None:
         return None
-    addon = addons.get(ADDON_ID)
-    if addon is None:
-        return None
-    return addon.preferences
+    for key in (ADDON_ID, ADDON_SHORT_ID):
+        addon = addons.get(key)
+        if addon is not None:
+            return addon.preferences
+
+    try:
+        for key, addon in addons.items():
+            if key == ADDON_SHORT_ID or key.endswith(f".{ADDON_SHORT_ID}"):
+                return addon.preferences
+    except Exception:
+        pass
+    return None
 
 
 def _parse_bool(value: Optional[str]) -> Optional[bool]:
