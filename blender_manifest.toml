@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "sutu_blender_bridge"
-version = "0.2.0"
+version = "0.2.1"
 name = "Sutu Blender Bridge"
 tagline = "Bridge V2 companion for streaming Blender viewport to Sutu"
 maintainer = "LiuYang"

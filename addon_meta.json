@@ -1,6 +1,6 @@
 {
   "id": "sutu_blender_bridge",
   "name": "Sutu Blender Bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "tagline": "Bridge V2 companion for streaming Blender viewport to Sutu"
 }
