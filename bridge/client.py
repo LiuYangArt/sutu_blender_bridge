@@ -15,8 +15,6 @@ import bpy
 from .debug_dump import get_bridge_debug_dumper
 from .framing import FrameDecoder, FrameError, encode_frame
 from .messages import (
-    BRIDGE_MODE_AUTO,
-    BRIDGE_MODE_MANUAL,
     BRIDGE_TRANSPORT_SHM,
     BRIDGE_TRANSPORT_TCP_LZ4,
     E_HEARTBEAT_TIMEOUT,
@@ -52,7 +50,6 @@ MAX_BINARY_FRAME_BYTES = 128 * 1024 * 1024
 
 @dataclass
 class BridgeClientConfig:
-    link_mode: str = BRIDGE_MODE_MANUAL
     port: int = 30121
     enable_connection: bool = False
 
@@ -80,7 +77,6 @@ class BridgeClient:
         self._state_lock = threading.Lock()
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._manual_connect_event = threading.Event()
         self._send_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=512)
 
         self._inflight_frame_ids: deque[int] = deque()
@@ -106,7 +102,6 @@ class BridgeClient:
             return {
                 "state": self._state,
                 "enabled": self._config.enable_connection,
-                "mode": self._config.link_mode,
                 "port": self._config.port,
                 "transport": self._transport,
                 "degraded": self._degraded,
@@ -122,13 +117,11 @@ class BridgeClient:
         with self._state_lock:
             return self._target_stream_width, self._target_stream_height
 
-    def configure(self, link_mode: str, port: int, enable_connection: bool) -> bool:
-        normalized_mode = BRIDGE_MODE_AUTO if link_mode == BRIDGE_MODE_AUTO else BRIDGE_MODE_MANUAL
+    def configure(self, port: int, enable_connection: bool) -> bool:
         if not self._validate_port(port):
             return False
 
         with self._state_lock:
-            self._config.link_mode = normalized_mode
             self._config.port = int(port)
             self._config.enable_connection = bool(enable_connection)
             if not enable_connection:
@@ -146,8 +139,7 @@ class BridgeClient:
         with self._state_lock:
             if self._state == "disabled":
                 self._state = "listening"
-        if normalized_mode == BRIDGE_MODE_AUTO:
-            self.request_connect()
+        self.request_connect()
         return True
 
     def request_connect(self) -> None:
@@ -156,7 +148,6 @@ class BridgeClient:
             if self._state == "disabled":
                 self._state = "listening"
         self._ensure_worker()
-        self._manual_connect_event.set()
 
     def disable_connection(self) -> None:
         with self._state_lock:
@@ -168,6 +159,7 @@ class BridgeClient:
             self._inflight_frame_ids.clear()
             self._target_stream_width = None
             self._target_stream_height = None
+            self._last_error = None
         self._stop_worker()
 
     def shutdown(self) -> None:
@@ -239,17 +231,16 @@ class BridgeClient:
 
     def _stop_worker(self) -> None:
         self._stop_event.set()
-        self._manual_connect_event.set()
         self._close_socket()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=2.0)
         self._worker_thread = None
         self._stop_event.clear()
-        self._manual_connect_event.clear()
 
     def _worker_main(self) -> None:
         backoff_index = 0
         while not self._stop_event.is_set():
+            fast_reconnect = False
             config = self._snapshot_config()
             if not config.enable_connection:
                 self._set_state("disabled")
@@ -258,10 +249,6 @@ class BridgeClient:
                 continue
 
             self._set_state("listening")
-            if config.link_mode == BRIDGE_MODE_MANUAL:
-                if not self._manual_connect_event.wait(timeout=0.2):
-                    continue
-                self._manual_connect_event.clear()
 
             try:
                 self._run_session(config)
@@ -269,7 +256,19 @@ class BridgeClient:
             except BridgeClientError as exc:
                 if exc.code == E_STOP_REQUESTED:
                     break
-                self._set_error(exc.code, str(exc))
+                if self._stop_event.is_set():
+                    self._clear_error()
+                    break
+                if not self._snapshot_config().enable_connection:
+                    self._clear_error()
+                    continue
+                if self._is_expected_peer_close_error(exc):
+                    # Sutu may proactively close socket after one-shot flow.
+                    # Treat this as a recoverable reconnect signal instead of user-facing error.
+                    fast_reconnect = True
+                    self._clear_error()
+                else:
+                    self._set_error(exc.code, str(exc))
             except (BridgeProtocolError, FrameError) as exc:
                 code = getattr(exc, "code", E_PROTO_MISMATCH)
                 self._set_error(code, str(exc))
@@ -285,9 +284,9 @@ class BridgeClient:
             if not self._snapshot_config().enable_connection:
                 continue
 
-            current_config = self._snapshot_config()
-            if current_config.link_mode == BRIDGE_MODE_MANUAL:
-                self._manual_connect_event.set()
+            if fast_reconnect:
+                backoff_index = 0
+                continue
 
             self._set_state("recovering")
             delay = RECONNECT_BACKOFF_SEC[min(backoff_index, len(RECONNECT_BACKOFF_SEC) - 1)]
@@ -450,7 +449,6 @@ class BridgeClient:
     def _snapshot_config(self) -> BridgeClientConfig:
         with self._state_lock:
             return BridgeClientConfig(
-                link_mode=self._config.link_mode,
                 port=self._config.port,
                 enable_connection=self._config.enable_connection,
             )
@@ -471,25 +469,10 @@ class BridgeClient:
         next_height = _normalize_optional_positive_int(target_height)
 
         with self._state_lock:
-            prev = (self._target_stream_width, self._target_stream_height)
-            curr = (next_width, next_height)
-            if prev == curr:
+            if (self._target_stream_width, self._target_stream_height) == (next_width, next_height):
                 return
-            self._target_stream_width, self._target_stream_height = curr
-
-        print(
-            "[SutuBridge] stream target hint updated "
-            f"{prev[0]}x{prev[1]} -> {curr[0]}x{curr[1]}"
-        )
-
-
-def _normalize_optional_positive_int(value: Any) -> Optional[int]:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    parsed = int(value)
-    if parsed <= 0:
-        return None
-    return parsed
+            self._target_stream_width = next_width
+            self._target_stream_height = next_height
 
     def _set_error(self, code: str, message: str) -> None:
         with self._state_lock:
@@ -539,6 +522,28 @@ def _normalize_optional_positive_int(value: Any) -> Optional[int]:
             return True
         self._set_error(E_PORT_INVALID, f"端口必须在 1024-65535 范围内，当前为 {port}")
         return False
+
+    def _is_expected_peer_close_error(self, exc: BridgeClientError) -> bool:
+        if exc.code != E_SOCKET_IO:
+            return False
+        text = str(exc)
+        if "socket 已被对端关闭" in text:
+            return True
+        lowered = text.lower()
+        if "winerror 10054" in lowered:
+            return True
+        if "forcibly closed by the remote host" in lowered:
+            return True
+        return False
+
+
+def _normalize_optional_positive_int(value: Any) -> Optional[int]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        return None
+    return parsed
 
 
 _BRIDGE_CLIENT: Optional[BridgeClient] = None
@@ -598,10 +603,6 @@ def _parse_startup_overrides() -> Dict[str, Any]:
     if env_port and env_port.isdigit():
         result["port"] = int(env_port)
 
-    env_mode = os.getenv("SUTU_BRIDGE_MODE")
-    if env_mode in {BRIDGE_MODE_AUTO, BRIDGE_MODE_MANUAL}:
-        result["link_mode"] = env_mode
-
     env_enable = _parse_bool(os.getenv("SUTU_BRIDGE_ENABLE"))
     if env_enable is not None:
         result["enable_connection"] = env_enable
@@ -615,12 +616,6 @@ def _parse_startup_overrides() -> Dict[str, Any]:
         if token == "--sutu-bridge-port" and i + 1 < len(extra_args):
             if extra_args[i + 1].isdigit():
                 result["port"] = int(extra_args[i + 1])
-            i += 2
-            continue
-        if token == "--sutu-bridge-mode" and i + 1 < len(extra_args):
-            mode = extra_args[i + 1].strip().lower()
-            if mode in {BRIDGE_MODE_AUTO, BRIDGE_MODE_MANUAL}:
-                result["link_mode"] = mode
             i += 2
             continue
         if token == "--sutu-bridge-enable":
@@ -643,25 +638,20 @@ def register() -> None:
     client = get_bridge_client()
     prefs = get_addon_preferences()
 
-    link_mode = BRIDGE_MODE_MANUAL
     port = 30121
-    enable_connection = False
+    enable_connection = True
 
     if prefs is not None:
-        link_mode = getattr(prefs, "link_mode", link_mode)
         port = int(getattr(prefs, "port", port))
-        enable_connection = bool(getattr(prefs, "enable_connection", enable_connection))
 
     overrides = _parse_startup_overrides()
-    link_mode = overrides.get("link_mode", link_mode)
     port = int(overrides.get("port", port))
     enable_connection = bool(overrides.get("enable_connection", enable_connection))
 
-    if not client.configure(link_mode=link_mode, port=port, enable_connection=enable_connection):
+    if not client.configure(port=port, enable_connection=enable_connection):
         return
 
-    should_connect = bool(overrides.get("connect_now", False))
-    if enable_connection and (link_mode == BRIDGE_MODE_AUTO or should_connect):
+    if bool(overrides.get("connect_now", False)):
         client.request_connect()
 
 

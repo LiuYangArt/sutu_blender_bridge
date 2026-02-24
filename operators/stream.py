@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 
 import bpy
@@ -9,13 +11,15 @@ try:
 except Exception:  # pragma: no cover - Blender runtime dependency
     np = None
 
-from ..bridge.client import get_bridge_client
+from ..bridge.client import get_addon_preferences, get_bridge_client
 from ..bridge.frame_sender import get_frame_sender, shutdown_frame_sender
+from ..bridge.messages import BRIDGE_TRANSPORT_SHM
 
 STATE_POLL_INTERVAL_SEC = 0.1
 SETTLE_DELAY_SEC = 0.35
 REDRAW_RETRY_INTERVAL_SEC = 0.05
 MIN_CAPTURE_INTERVAL_SEC = 0.2
+ONE_SHOT_SHM_STOP_DELAY_SEC = 0.5
 
 _DRAW_HANDLER = None
 _LAST_CAPTURE_AT = 0.0
@@ -31,6 +35,22 @@ _OFFSCREEN_LAYOUT_LOGGED = False
 _DOWNSCALE_LOG_SIGNATURE = None
 _DOWNSCALE_INDEX_CACHE = {}
 _WAITING_HINT_LOGGED = False
+_RENDER_SEND_PENDING = False
+_DRAW_VIEW3D_OVERLAY_KW_SUPPORTED = None
+
+
+def _show_bridge_popup(message: str, icon: str = "INFO") -> None:
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None:
+        return
+
+    def _draw(self, _context):
+        self.layout.label(text=message)
+
+    try:
+        window_manager.popup_menu(_draw, title="Sutu Bridge", icon=icon)
+    except Exception:
+        pass
 
 
 def _as_optional_int(value):
@@ -65,9 +85,36 @@ def _iter_view3d_window_regions():
                     yield region
 
 
+def _iter_view3d_window_contexts():
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = window.screen
+        if screen is None:
+            continue
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            space = getattr(area.spaces, "active", None)
+            if space is None or getattr(space, "type", "") != "VIEW_3D":
+                continue
+            for region in area.regions:
+                if region.type == "WINDOW":
+                    yield window, area, region, space
+
+
 def _tag_stream_regions_redraw() -> None:
     for region in _iter_view3d_window_regions():
         region.tag_redraw()
+
+
+def _stop_live_stream_for_one_shot(reason: str) -> None:
+    sender = get_frame_sender()
+    if sender.is_streaming:
+        sender.stop_stream(reason=reason)
+    _remove_stream_hooks()
+    _reset_stream_state()
 
 
 def _build_view_signature():
@@ -334,31 +381,45 @@ def _draw_offscreen_view3d(
     view_matrix,
     projection_matrix,
 ) -> None:
+    global _DRAW_VIEW3D_OVERLAY_KW_SUPPORTED
+
+    draw_background = None
     if _is_film_transparent_enabled(context):
+        draw_background = False
+
+    def _draw_once(disable_overlay: bool, use_draw_background: bool) -> None:
+        kwargs = {"do_color_management": True}
+        if use_draw_background and draw_background is not None:
+            kwargs["draw_background"] = draw_background
+        if disable_overlay:
+            kwargs["draw_overlays"] = False
+            kwargs["draw_gizmo"] = False
+        offscreen.draw_view3d(
+            context.scene,
+            context.view_layer,
+            space,
+            region,
+            view_matrix,
+            projection_matrix,
+            **kwargs,
+        )
+
+    if _DRAW_VIEW3D_OVERLAY_KW_SUPPORTED is not False:
         try:
-            offscreen.draw_view3d(
-                context.scene,
-                context.view_layer,
-                space,
-                region,
-                view_matrix,
-                projection_matrix,
-                do_color_management=True,
-                draw_background=False,
-            )
+            _draw_once(disable_overlay=True, use_draw_background=True)
+            _DRAW_VIEW3D_OVERLAY_KW_SUPPORTED = True
+            return
+        except TypeError:
+            _DRAW_VIEW3D_OVERLAY_KW_SUPPORTED = False
+
+    if draw_background is not None:
+        try:
+            _draw_once(disable_overlay=False, use_draw_background=True)
             return
         except TypeError:
             pass
 
-    offscreen.draw_view3d(
-        context.scene,
-        context.view_layer,
-        space,
-        region,
-        view_matrix,
-        projection_matrix,
-        do_color_management=True,
-    )
+    _draw_once(disable_overlay=False, use_draw_background=False)
 
 
 def _pack_offscreen_texture_to_bytes(texture_data, width: int, height: int):
@@ -579,6 +640,236 @@ def _downscale_for_stream(width: int, height: int, pixels: bytes) -> tuple[int, 
         return width, height, pixels
 
 
+def _capture_viewport_frame_once() -> tuple[int, int, bytes] | None:
+    for window, area, region, space in _iter_view3d_window_contexts():
+        width = int(getattr(region, "width", 0))
+        height = int(getattr(region, "height", 0))
+        if width <= 0 or height <= 0:
+            continue
+
+        try:
+            with bpy.context.temp_override(window=window, area=area, region=region, space_data=space):
+                pixels = _capture_with_offscreen(width, height)
+                if pixels is None:
+                    frame_buffer = gpu.state.active_framebuffer_get()
+                    if frame_buffer is None:
+                        continue
+                    pixels = _capture_best_color_bytes(frame_buffer, width, height)
+        except Exception:
+            continue
+
+        if pixels is None:
+            continue
+        return _downscale_for_stream(width, height, pixels)
+    return None
+
+
+def _capture_render_result_pixels() -> tuple[int, int, bytes] | None:
+    image = bpy.data.images.get("Render Result")
+    if image is None:
+        return None
+
+    direct = _capture_image_pixels_rgba8(image)
+    if direct is not None:
+        return direct
+    return _capture_render_result_via_temp_file(image)
+
+
+def _capture_image_pixels_rgba8(image) -> tuple[int, int, bytes] | None:
+    width = int(getattr(image, "size", [0, 0])[0] if getattr(image, "size", None) else 0)
+    height = int(getattr(image, "size", [0, 0])[1] if getattr(image, "size", None) else 0)
+    if width <= 0 or height <= 0:
+        return None
+
+    expected_len = width * height * 4
+    try:
+        if np is not None:
+            pixels_f32 = np.empty(expected_len, dtype=np.float32)
+            image.pixels.foreach_get(pixels_f32)
+        else:
+            pixels_f32 = list(image.pixels[:expected_len])
+    except Exception:
+        return None
+    if len(pixels_f32) < expected_len:
+        return None
+
+    if np is not None:
+        try:
+            frame = np.array(pixels_f32[:expected_len], dtype=np.float32).reshape(height, width, 4)
+            packed = np.clip(frame * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
+            packed = np.ascontiguousarray(packed[::-1, :, :4])
+            return _downscale_for_stream(width, height, packed.tobytes())
+        except Exception:
+            pass
+
+    packed = bytearray(expected_len)
+    dst = 0
+    for y in range(height - 1, -1, -1):
+        row_start = y * width * 4
+        row_end = row_start + width * 4
+        for value in pixels_f32[row_start:row_end]:
+            clamped = max(0.0, min(1.0, float(value)))
+            packed[dst] = int(clamped * 255.0 + 0.5)
+            dst += 1
+    return _downscale_for_stream(width, height, bytes(packed))
+
+
+def _capture_render_result_via_temp_file(image) -> tuple[int, int, bytes] | None:
+    temp_path = ""
+    loaded_image = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="sutu_bridge_render_result_",
+            suffix=".png",
+            delete=False,
+        ) as fp:
+            temp_path = fp.name
+        image.save_render(temp_path, scene=bpy.context.scene)
+        loaded_image = bpy.data.images.load(temp_path, check_existing=False)
+        return _capture_image_pixels_rgba8(loaded_image)
+    except Exception:
+        return None
+    finally:
+        if loaded_image is not None:
+            try:
+                bpy.data.images.remove(loaded_image)
+            except Exception:
+                pass
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
+
+def _send_single_frame_to_bridge(width: int, height: int, pixels: bytes, stop_reason: str) -> Optional[int]:
+    sender = get_frame_sender()
+    sender.start_stream(stream_id=None)
+    try:
+        frame_id = sender.send_rgba_frame(width=width, height=height, pixels=pixels)
+    except Exception:
+        sender.stop_stream(reason=stop_reason)
+        raise
+
+    if frame_id is None:
+        sender.stop_stream(reason=stop_reason)
+        return None
+
+    if get_bridge_client().selected_transport == BRIDGE_TRANSPORT_SHM:
+        _defer_one_shot_stream_stop(reason=stop_reason, delay_sec=ONE_SHOT_SHM_STOP_DELAY_SEC)
+    else:
+        sender.stop_stream(reason=stop_reason)
+    return frame_id
+
+
+def _defer_one_shot_stream_stop(reason: str, delay_sec: float) -> None:
+    def _timer_callback():
+        sender = get_frame_sender()
+        if not sender.is_streaming:
+            return None
+        # If live stream resumed, do not interrupt user flow.
+        if _DRAW_HANDLER is not None:
+            return None
+        sender.stop_stream(reason=reason)
+        return None
+
+    try:
+        bpy.app.timers.register(_timer_callback, first_interval=max(0.05, float(delay_sec)))
+    except Exception:
+        get_frame_sender().stop_stream(reason=reason)
+
+
+def _send_render_result_payload(captured: tuple[int, int, bytes], stop_reason: str) -> Optional[int]:
+    width, height, pixels = captured
+    return _send_single_frame_to_bridge(
+        width=width,
+        height=height,
+        pixels=pixels,
+        stop_reason=stop_reason,
+    )
+
+
+def _complete_render_send_from_result() -> None:
+    captured = _capture_render_result_pixels()
+    if captured is None:
+        message = "渲染完成，但读取 Render Result 失败"
+        print(f"[SutuBridge] {message}")
+        _show_bridge_popup(message, icon="ERROR")
+        return
+
+    frame_id = _send_render_result_payload(
+        captured=captured,
+        stop_reason="render_result_sent",
+    )
+    if frame_id is None:
+        message = "渲染完成，但发送 Render Result 失败"
+        print(f"[SutuBridge] {message}")
+        _show_bridge_popup(message, icon="ERROR")
+        return
+
+    print(f"[SutuBridge] Render Result 已发送 frame_id={frame_id}")
+    _show_bridge_popup(f"已发送 Render Result frame_id={frame_id}", icon="INFO")
+
+
+def _on_render_send_complete(_scene, _depsgraph=None) -> None:
+    global _RENDER_SEND_PENDING
+    if not _RENDER_SEND_PENDING:
+        return
+    _RENDER_SEND_PENDING = False
+    _remove_render_send_handlers()
+    _complete_render_send_from_result()
+
+
+def _on_render_send_cancel(_scene, _depsgraph=None) -> None:
+    global _RENDER_SEND_PENDING
+    if not _RENDER_SEND_PENDING:
+        return
+    _RENDER_SEND_PENDING = False
+    _remove_render_send_handlers()
+    message = "渲染已取消，未发送 Render Result"
+    print(f"[SutuBridge] {message}")
+    _show_bridge_popup(message, icon="ERROR")
+
+
+def _ensure_render_send_handlers() -> None:
+    if _on_render_send_complete not in bpy.app.handlers.render_complete:
+        bpy.app.handlers.render_complete.append(_on_render_send_complete)
+    if _on_render_send_cancel not in bpy.app.handlers.render_cancel:
+        bpy.app.handlers.render_cancel.append(_on_render_send_cancel)
+
+
+def _remove_render_send_handlers() -> None:
+    try:
+        bpy.app.handlers.render_complete.remove(_on_render_send_complete)
+    except Exception:
+        pass
+    try:
+        bpy.app.handlers.render_cancel.remove(_on_render_send_cancel)
+    except Exception:
+        pass
+
+
+def _trigger_async_render_send() -> tuple[bool, str]:
+    global _RENDER_SEND_PENDING
+    if _RENDER_SEND_PENDING:
+        return False, "渲染发送任务已在进行中"
+
+    _ensure_render_send_handlers()
+    _RENDER_SEND_PENDING = True
+    try:
+        result = bpy.ops.render.render("INVOKE_DEFAULT", use_viewport=False, write_still=False)
+    except Exception as exc:
+        _RENDER_SEND_PENDING = False
+        _remove_render_send_handlers()
+        return False, f"触发渲染失败: {exc}"
+
+    if "CANCELLED" in result:
+        _RENDER_SEND_PENDING = False
+        _remove_render_send_handlers()
+        return False, "渲染已取消"
+    return True, ""
+
+
 def _ensure_stream_hooks() -> None:
     global _DRAW_HANDLER, _DEPSGRAPH_HANDLER
     if _DRAW_HANDLER is None:
@@ -673,7 +964,91 @@ class SUTU_OT_bridge_stop_stream(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SUTU_OT_bridge_send_current_frame(bpy.types.Operator):
+    bl_idname = "sutu_bridge.send_current_frame"
+    bl_label = "Send Current Frame"
+    bl_description = "发送当前视口单帧到 Sutu（会先停止实时推流）"
+
+    def execute(self, context: bpy.types.Context):
+        client = get_bridge_client()
+        status = client.get_status()
+        if status.get("state") != "streaming":
+            self.report({"ERROR"}, "请先连接 Sutu Bridge")
+            return {"CANCELLED"}
+
+        _stop_live_stream_for_one_shot(reason="send_current_frame")
+
+        captured = _capture_viewport_frame_once()
+        if captured is None:
+            self.report({"ERROR"}, "未找到可用的 3D 视口，无法采集当前帧")
+            return {"CANCELLED"}
+
+        width, height, pixels = captured
+        frame_id = _send_single_frame_to_bridge(
+            width=width,
+            height=height,
+            pixels=pixels,
+            stop_reason="single_frame_sent",
+        )
+        if frame_id is None:
+            self.report({"ERROR"}, "单帧发送失败")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"已发送当前单帧 frame_id={frame_id}")
+        return {"FINISHED"}
+
+
+class SUTU_OT_bridge_send_render_result(bpy.types.Operator):
+    bl_idname = "sutu_bridge.send_render_result"
+    bl_label = "Send Render Result"
+    bl_description = "发送 Render Result（可配置是否先触发重渲染，会先停止实时推流）"
+
+    def execute(self, context: bpy.types.Context):
+        client = get_bridge_client()
+        status = client.get_status()
+        if status.get("state") != "streaming":
+            self.report({"ERROR"}, "请先连接 Sutu Bridge")
+            return {"CANCELLED"}
+
+        _stop_live_stream_for_one_shot(reason="send_render_result")
+
+        prefs = get_addon_preferences(context)
+        use_existing = bool(getattr(prefs, "send_render_use_existing_result", False))
+        if use_existing:
+            captured = _capture_render_result_pixels()
+            if captured is None:
+                self.report({"ERROR"}, "当前 Render Result 不可读，请先渲染一次或关闭“Use Existing Result”")
+                return {"CANCELLED"}
+            frame_id = _send_render_result_payload(
+                captured=captured,
+                stop_reason="render_result_sent",
+            )
+            if frame_id is None:
+                self.report({"ERROR"}, "Render Result 发送失败")
+                return {"CANCELLED"}
+            self.report({"INFO"}, f"已发送 Render Result frame_id={frame_id}")
+            return {"FINISHED"}
+
+        scene = getattr(context, "scene", None)
+        if scene is None or getattr(scene, "camera", None) is None:
+            self.report(
+                {"ERROR"},
+                "当前场景没有相机。请先添加相机（Shift+A -> Camera），或勾选 Use Existing Render Result 发送现有结果。",
+            )
+            return {"CANCELLED"}
+
+        ok, message = _trigger_async_render_send()
+        if not ok:
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已触发渲染，完成后将自动发送 Render Result")
+        return {"FINISHED"}
+
+
 def unregister() -> None:
+    global _RENDER_SEND_PENDING
+    _RENDER_SEND_PENDING = False
+    _remove_render_send_handlers()
     _remove_stream_hooks()
     _reset_stream_state()
     shutdown_frame_sender()

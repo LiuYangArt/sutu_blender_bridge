@@ -4,45 +4,31 @@ import bpy
 
 from ..bridge.client import (
     ADDON_ID,
-    BRIDGE_MODE_AUTO,
-    BRIDGE_MODE_MANUAL,
     get_addon_preferences,
     get_bridge_client,
 )
 from ..bridge.frame_sender import get_frame_sender
 
 
-def _apply_bridge_preferences(context: Optional[bpy.types.Context], connect_now: bool) -> None:
+def _apply_bridge_preferences(context: Optional[bpy.types.Context]) -> None:
     prefs = get_addon_preferences(context)
     if prefs is None:
         return
 
     client = get_bridge_client()
+    enabled = bool(client.get_status().get("enabled", True))
     ok = client.configure(
-        link_mode=str(getattr(prefs, "link_mode", BRIDGE_MODE_MANUAL)),
         port=int(getattr(prefs, "port", 30121)),
-        enable_connection=bool(getattr(prefs, "enable_connection", False)),
+        enable_connection=enabled,
     )
     if not ok:
-        if bool(getattr(prefs, "enable_connection", False)):
-            prefs.enable_connection = False
+        if enabled:
+            client.disable_connection()
         return
-    if bool(getattr(prefs, "enable_connection", False)) and connect_now:
-        client.request_connect()
 
 
 def _on_bridge_config_updated(self, context: Optional[bpy.types.Context]) -> None:
-    connect_now = bool(
-        getattr(self, "enable_connection", False) and getattr(self, "link_mode", "") == BRIDGE_MODE_AUTO
-    )
-    _apply_bridge_preferences(context, connect_now=connect_now)
-
-
-def _on_bridge_enable_updated(self, context: Optional[bpy.types.Context]) -> None:
-    enabled = bool(getattr(self, "enable_connection", False))
-    _apply_bridge_preferences(context, connect_now=enabled)
-    if not enabled:
-        get_bridge_client().disable_connection()
+    _apply_bridge_preferences(context)
 
 
 def _draw_debug_options(layout, prefs) -> None:
@@ -60,17 +46,6 @@ def _draw_debug_options(layout, prefs) -> None:
 class SUTUBridgeAddonPreferences(bpy.types.AddonPreferences):
     bl_idname = ADDON_ID
 
-    link_mode: bpy.props.EnumProperty(  # type: ignore
-        name="Link Mode",
-        description="选择自动连接或手动连接",
-        items=(
-            (BRIDGE_MODE_AUTO, "Auto", "自动模式：启用后自动尝试连接"),
-            (BRIDGE_MODE_MANUAL, "Manual", "手动模式：点击 Connect 触发连接"),
-        ),
-        default=BRIDGE_MODE_MANUAL,
-        update=_on_bridge_config_updated,
-    )
-
     port: bpy.props.IntProperty(  # type: ignore
         name="Port",
         description="Sutu Bridge 监听端口",
@@ -80,11 +55,10 @@ class SUTUBridgeAddonPreferences(bpy.types.AddonPreferences):
         update=_on_bridge_config_updated,
     )
 
-    enable_connection: bpy.props.BoolProperty(  # type: ignore
-        name="Enable Connection",
-        description="启用连接后客户端会保持监听/重连",
+    send_render_use_existing_result: bpy.props.BoolProperty(  # type: ignore
+        name="Use Existing Render Result",
+        description="启用后 Send Render 不触发重渲染，直接发送当前 Render Result",
         default=False,
-        update=_on_bridge_enable_updated,
     )
 
     auto_install_lz4: bpy.props.BoolProperty(  # type: ignore
@@ -116,9 +90,7 @@ class SUTUBridgeAddonPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
-        layout.prop(self, "link_mode")
         layout.prop(self, "port")
-        layout.prop(self, "enable_connection")
         _draw_debug_options(layout, self)
 
 
@@ -136,10 +108,7 @@ class SUTU_PT_bridge_panel(bpy.types.Panel):
             layout.label(text="插件配置未就绪", icon="ERROR")
             return
 
-        layout.prop(prefs, "link_mode")
-        layout.prop(prefs, "port")
-        layout.prop(prefs, "enable_connection")
-        _draw_debug_options(layout, prefs)
+        layout.prop(prefs, "send_render_use_existing_result")
 
         status = get_bridge_client().get_status()
         status_row = layout.column(align=True)
@@ -166,3 +135,8 @@ class SUTU_PT_bridge_panel(bpy.types.Panel):
             row.operator("sutu_bridge.stop_stream", text="Stop Stream", icon="PAUSE")
         else:
             row.operator("sutu_bridge.start_stream", text="Start Stream", icon="PLAY")
+
+        one_shot_row = layout.row(align=True)
+        one_shot_row.enabled = status.get("state") == "streaming"
+        one_shot_row.operator("sutu_bridge.send_current_frame", text="Send Viewport", icon="IMAGE_DATA")
+        one_shot_row.operator("sutu_bridge.send_render_result", text="Send Render", icon="RENDER_STILL")

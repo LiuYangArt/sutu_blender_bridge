@@ -118,10 +118,6 @@ class FrameSender:
                 frame_id=frame_id,
                 timestamp_ms=ts_ms,
             )
-            print(
-                f"[SutuBridge] shm frame_meta frame_id={frame_id} slot={slot} "
-                f"w={width} h={height} stride={stride} ring={self._last_ring_name}"
-            )
             self._client.enqueue_control_message(
                 build_frame_meta(
                     frame_id=frame_id,
