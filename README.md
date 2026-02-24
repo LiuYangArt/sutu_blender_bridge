@@ -83,20 +83,20 @@
 执行：
 
 ```bat
-release.bat
+_dev\release.bat
 ```
 
-默认会做 `patch` 升版并触发 GitHub Action。
+不带参数时会弹出菜单，可直接选择 `patch / minor / major / 指定版本`。
 
 也可以指定版本策略或显式版本：
 
 ```bat
-release.bat minor
-release.bat major
-release.bat 0.3.0
+_dev\release.bat minor
+_dev\release.bat major
+_dev\release.bat 0.3.0
 ```
 
-`release.bat` 流程：
+`_dev\release.bat` 流程：
 
 1. 自动更新版本号（`addon_meta.json`）
 2. 同步 `blender_manifest.toml`

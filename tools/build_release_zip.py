@@ -11,6 +11,7 @@ DIST_DIR = ROOT_DIR / "dist"
 META_PATH = ROOT_DIR / "addon_meta.json"
 
 EXCLUDE_PREFIXES = (
+    "_dev/",
     ".github/",
     ".vscode/",
     "__pycache__/",
@@ -18,6 +19,7 @@ EXCLUDE_PREFIXES = (
 )
 
 EXCLUDE_FILES = {
+    ".gitignore",
     "AGENTS.md",
     "release.bat",
     "sutu_blender_bridge.code-workspace",
