@@ -12,7 +12,7 @@
 
 ### 方式 1：从 Release 安装（推荐）
 
-1. 在 GitHub Releases 下载 `sutu_blender_bridge-x.y.z.zip`
+1. 在 [GitHub Releases](https://github.com/LiuYangArt/sutu_blender_bridge/releases) 下载 `sutu_blender_bridge-x.y.z.zip`
 2. Blender -> `Edit` -> `Preferences` -> `Add-ons` -> `Install from Disk`
 3. 选择下载的 zip 并启用插件
 4. 在 3D 视图右侧侧栏的 `Sutu` 标签页找到 `Sutu Bridge` 面板
