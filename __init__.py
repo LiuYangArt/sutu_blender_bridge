@@ -22,14 +22,26 @@ bl_info = {
     "category": "3D View",
 }
 
+import bpy
+
 from . import auto_load
+from .i18n import translations_dict
 
 auto_load.init()
 
 
 def register():
+    try:
+        bpy.app.translations.unregister(__name__)
+    except Exception:
+        pass
+    bpy.app.translations.register(__name__, translations_dict)
     auto_load.register()
 
 
 def unregister():
     auto_load.unregister()
+    try:
+        bpy.app.translations.unregister(__name__)
+    except Exception:
+        pass

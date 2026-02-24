@@ -639,7 +639,8 @@ def register() -> None:
     prefs = get_addon_preferences()
 
     port = 30121
-    enable_connection = True
+    # Keep startup behavior deterministic: never auto-connect unless explicitly overridden.
+    enable_connection = False
 
     if prefs is not None:
         port = int(getattr(prefs, "port", port))

@@ -6,6 +6,7 @@ import time
 
 import bpy
 import gpu
+from bpy.app.translations import pgettext_iface as _
 try:
     import numpy as np
 except Exception:  # pragma: no cover - Blender runtime dependency
@@ -36,6 +37,7 @@ _DOWNSCALE_LOG_SIGNATURE = None
 _DOWNSCALE_INDEX_CACHE = {}
 _WAITING_HINT_LOGGED = False
 _RENDER_SEND_PENDING = False
+_RENDER_SEND_EVENT = None
 _DRAW_VIEW3D_OVERLAY_KW_SUPPORTED = None
 
 
@@ -48,7 +50,7 @@ def _show_bridge_popup(message: str, icon: str = "INFO") -> None:
         self.layout.label(text=message)
 
     try:
-        window_manager.popup_menu(_draw, title="Sutu Bridge", icon=icon)
+        window_manager.popup_menu(_draw, title=_("Sutu Bridge"), icon=icon)
     except Exception:
         pass
 
@@ -792,7 +794,7 @@ def _send_render_result_payload(captured: tuple[int, int, bytes], stop_reason: s
 def _complete_render_send_from_result() -> None:
     captured = _capture_render_result_pixels()
     if captured is None:
-        message = "渲染完成，但读取 Render Result 失败"
+        message = _("Render finished, but failed to read Render Result")
         print(f"[SutuBridge] {message}")
         _show_bridge_popup(message, icon="ERROR")
         return
@@ -802,33 +804,59 @@ def _complete_render_send_from_result() -> None:
         stop_reason="render_result_sent",
     )
     if frame_id is None:
-        message = "渲染完成，但发送 Render Result 失败"
+        message = _("Render finished, but failed to send Render Result")
         print(f"[SutuBridge] {message}")
         _show_bridge_popup(message, icon="ERROR")
         return
 
     print(f"[SutuBridge] Render Result 已发送 frame_id={frame_id}")
-    _show_bridge_popup(f"已发送 Render Result frame_id={frame_id}", icon="INFO")
+    _show_bridge_popup(_("Render Result sent frame_id={frame_id}").format(frame_id=frame_id), icon="INFO")
+
+
+def _ensure_render_send_timer() -> None:
+    if bpy.app.timers.is_registered(_render_send_event_timer):
+        return
+    bpy.app.timers.register(_render_send_event_timer, first_interval=0.05)
+
+
+def _render_send_event_timer():
+    global _RENDER_SEND_PENDING, _RENDER_SEND_EVENT
+    event = _RENDER_SEND_EVENT
+    if event is None:
+        if _RENDER_SEND_PENDING:
+            # Keep polling while render job is running. Final send is performed
+            # only after render_complete/render_cancel sets an event.
+            return 0.1
+        return None
+
+    _RENDER_SEND_EVENT = None
+    _RENDER_SEND_PENDING = False
+    _remove_render_send_handlers()
+
+    if event == "complete":
+        _complete_render_send_from_result()
+        return None
+
+    message = _("Render canceled; Render Result not sent")
+    print(f"[SutuBridge] {message}")
+    _show_bridge_popup(message, icon="ERROR")
+    return None
 
 
 def _on_render_send_complete(_scene, _depsgraph=None) -> None:
-    global _RENDER_SEND_PENDING
+    global _RENDER_SEND_EVENT
     if not _RENDER_SEND_PENDING:
         return
-    _RENDER_SEND_PENDING = False
-    _remove_render_send_handlers()
-    _complete_render_send_from_result()
+    _RENDER_SEND_EVENT = "complete"
+    _ensure_render_send_timer()
 
 
 def _on_render_send_cancel(_scene, _depsgraph=None) -> None:
-    global _RENDER_SEND_PENDING
+    global _RENDER_SEND_EVENT
     if not _RENDER_SEND_PENDING:
         return
-    _RENDER_SEND_PENDING = False
-    _remove_render_send_handlers()
-    message = "渲染已取消，未发送 Render Result"
-    print(f"[SutuBridge] {message}")
-    _show_bridge_popup(message, icon="ERROR")
+    _RENDER_SEND_EVENT = "cancel"
+    _ensure_render_send_timer()
 
 
 def _ensure_render_send_handlers() -> None:
@@ -850,23 +878,27 @@ def _remove_render_send_handlers() -> None:
 
 
 def _trigger_async_render_send() -> tuple[bool, str]:
-    global _RENDER_SEND_PENDING
+    global _RENDER_SEND_PENDING, _RENDER_SEND_EVENT
     if _RENDER_SEND_PENDING:
-        return False, "渲染发送任务已在进行中"
+        return False, _("A render-send task is already running")
 
     _ensure_render_send_handlers()
     _RENDER_SEND_PENDING = True
+    _RENDER_SEND_EVENT = None
+    _ensure_render_send_timer()
     try:
         result = bpy.ops.render.render("INVOKE_DEFAULT", use_viewport=False, write_still=False)
     except Exception as exc:
         _RENDER_SEND_PENDING = False
+        _RENDER_SEND_EVENT = None
         _remove_render_send_handlers()
-        return False, f"触发渲染失败: {exc}"
+        return False, _("Failed to start render: {error}").format(error=exc)
 
     if "CANCELLED" in result:
         _RENDER_SEND_PENDING = False
+        _RENDER_SEND_EVENT = None
         _remove_render_send_handlers()
-        return False, "渲染已取消"
+        return False, _("Render canceled")
     return True, ""
 
 
@@ -932,13 +964,13 @@ def _reset_stream_state() -> None:
 class SUTU_OT_bridge_start_stream(bpy.types.Operator):
     bl_idname = "sutu_bridge.start_stream"
     bl_label = "Start Stream"
-    bl_description = "开始推送 Blender 视口帧"
+    bl_description = "Start streaming Blender viewport frames"
 
     def execute(self, context: bpy.types.Context):
         client = get_bridge_client()
         status = client.get_status()
         if status.get("state") != "streaming":
-            self.report({"ERROR"}, "请先连接 Sutu Bridge")
+            self.report({"ERROR"}, _("Please connect Sutu Bridge first"))
             return {"CANCELLED"}
 
         sender = get_frame_sender()
@@ -946,41 +978,41 @@ class SUTU_OT_bridge_start_stream(bpy.types.Operator):
         _reset_stream_state()
         _ensure_stream_hooks()
         _request_capture_now()
-        self.report({"INFO"}, "已开始推流")
+        self.report({"INFO"}, _("Stream started"))
         return {"FINISHED"}
 
 
 class SUTU_OT_bridge_stop_stream(bpy.types.Operator):
     bl_idname = "sutu_bridge.stop_stream"
     bl_label = "Stop Stream"
-    bl_description = "停止推送 Blender 视口帧"
+    bl_description = "Stop streaming Blender viewport frames"
 
     def execute(self, context: bpy.types.Context):
         sender = get_frame_sender()
         sender.stop_stream(reason="user_stopped")
         _remove_stream_hooks()
         _reset_stream_state()
-        self.report({"INFO"}, "已停止推流")
+        self.report({"INFO"}, _("Stream stopped"))
         return {"FINISHED"}
 
 
 class SUTU_OT_bridge_send_current_frame(bpy.types.Operator):
     bl_idname = "sutu_bridge.send_current_frame"
     bl_label = "Send Current Frame"
-    bl_description = "发送当前视口单帧到 Sutu（会先停止实时推流）"
+    bl_description = "Send the current viewport frame to Sutu (live stream stops first)"
 
     def execute(self, context: bpy.types.Context):
         client = get_bridge_client()
         status = client.get_status()
         if status.get("state") != "streaming":
-            self.report({"ERROR"}, "请先连接 Sutu Bridge")
+            self.report({"ERROR"}, _("Please connect Sutu Bridge first"))
             return {"CANCELLED"}
 
         _stop_live_stream_for_one_shot(reason="send_current_frame")
 
         captured = _capture_viewport_frame_once()
         if captured is None:
-            self.report({"ERROR"}, "未找到可用的 3D 视口，无法采集当前帧")
+            self.report({"ERROR"}, _("No available 3D viewport found; cannot capture current frame"))
             return {"CANCELLED"}
 
         width, height, pixels = captured
@@ -991,23 +1023,23 @@ class SUTU_OT_bridge_send_current_frame(bpy.types.Operator):
             stop_reason="single_frame_sent",
         )
         if frame_id is None:
-            self.report({"ERROR"}, "单帧发送失败")
+            self.report({"ERROR"}, _("Failed to send current frame"))
             return {"CANCELLED"}
 
-        self.report({"INFO"}, f"已发送当前单帧 frame_id={frame_id}")
+        self.report({"INFO"}, _("Current frame sent frame_id={frame_id}").format(frame_id=frame_id))
         return {"FINISHED"}
 
 
 class SUTU_OT_bridge_send_render_result(bpy.types.Operator):
     bl_idname = "sutu_bridge.send_render_result"
     bl_label = "Send Render Result"
-    bl_description = "发送 Render Result（可配置是否先触发重渲染，会先停止实时推流）"
+    bl_description = "Send Render Result (optionally re-render first; live stream stops first)"
 
     def execute(self, context: bpy.types.Context):
         client = get_bridge_client()
         status = client.get_status()
         if status.get("state") != "streaming":
-            self.report({"ERROR"}, "请先连接 Sutu Bridge")
+            self.report({"ERROR"}, _("Please connect Sutu Bridge first"))
             return {"CANCELLED"}
 
         _stop_live_stream_for_one_shot(reason="send_render_result")
@@ -1017,23 +1049,28 @@ class SUTU_OT_bridge_send_render_result(bpy.types.Operator):
         if use_existing:
             captured = _capture_render_result_pixels()
             if captured is None:
-                self.report({"ERROR"}, "当前 Render Result 不可读，请先渲染一次或关闭“Use Existing Result”")
+                self.report(
+                    {"ERROR"},
+                    _("Current Render Result is not readable; render once first or disable \"Use Existing Render Result\""),
+                )
                 return {"CANCELLED"}
             frame_id = _send_render_result_payload(
                 captured=captured,
                 stop_reason="render_result_sent",
             )
             if frame_id is None:
-                self.report({"ERROR"}, "Render Result 发送失败")
+                self.report({"ERROR"}, _("Failed to send Render Result"))
                 return {"CANCELLED"}
-            self.report({"INFO"}, f"已发送 Render Result frame_id={frame_id}")
+            self.report({"INFO"}, _("Render Result sent frame_id={frame_id}").format(frame_id=frame_id))
             return {"FINISHED"}
 
         scene = getattr(context, "scene", None)
         if scene is None or getattr(scene, "camera", None) is None:
             self.report(
                 {"ERROR"},
-                "当前场景没有相机。请先添加相机（Shift+A -> Camera），或勾选 Use Existing Render Result 发送现有结果。",
+                _(
+                    "No camera in current scene. Add one first (Shift+A -> Camera), or enable Use Existing Render Result to send the existing result."
+                ),
             )
             return {"CANCELLED"}
 
@@ -1041,13 +1078,16 @@ class SUTU_OT_bridge_send_render_result(bpy.types.Operator):
         if not ok:
             self.report({"ERROR"}, message)
             return {"CANCELLED"}
-        self.report({"INFO"}, "已触发渲染，完成后将自动发送 Render Result")
+        self.report({"INFO"}, _("Render triggered. Render Result will be sent automatically when done."))
         return {"FINISHED"}
 
 
 def unregister() -> None:
-    global _RENDER_SEND_PENDING
+    global _RENDER_SEND_PENDING, _RENDER_SEND_EVENT
     _RENDER_SEND_PENDING = False
+    _RENDER_SEND_EVENT = None
+    if bpy.app.timers.is_registered(_render_send_event_timer):
+        bpy.app.timers.unregister(_render_send_event_timer)
     _remove_render_send_handlers()
     _remove_stream_hooks()
     _reset_stream_state()
