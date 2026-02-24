@@ -11,12 +11,14 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+from .addon_meta import ADDON_NAME, ADDON_TAGLINE, ADDON_VERSION
+
 bl_info = {
-    "name": "Sutu Blender Bridge",
+    "name": ADDON_NAME,
     "author": "LiuYang",
-    "description": "Bridge V2 companion for streaming Blender viewport to Sutu",
+    "description": ADDON_TAGLINE,
     "blender": (4, 2, 0),
-    "version": (0, 2, 0),
+    "version": ADDON_VERSION,
     "location": "View3D > Sidebar > Sutu > Bridge",
     "warning": "",
     "category": "3D View",

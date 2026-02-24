@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import bpy
 
+from ..addon_meta import ADDON_VERSION_STR
 from .debug_dump import get_bridge_debug_dumper
 from .framing import FrameDecoder, FrameError, encode_frame
 from .messages import (
@@ -83,7 +84,7 @@ class BridgeClient:
         self._max_inflight_frames = MAX_INFLIGHT_FRAMES
 
         self._client_name = "sutu_blender_bridge"
-        self._client_version = "0.2.0"
+        self._client_version = ADDON_VERSION_STR
         self._capabilities = ["shm_ring", "tcp_lz4", "chunked_frame"]
         self._debug_dumper = get_bridge_debug_dumper()
 

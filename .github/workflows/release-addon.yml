@@ -1,0 +1,64 @@
+name: Release Blender Addon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read metadata
+        id: meta
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = json.loads(Path("addon_meta.json").read_text(encoding="utf-8"))
+          version = str(data["version"])
+          addon_id = str(data["id"])
+          tag = f"v{version}"
+          print(f"version={version}")
+          print(f"addon_id={addon_id}")
+          print(f"tag={tag}")
+          with open(Path(os.environ["GITHUB_OUTPUT"]), "a", encoding="utf-8") as handle:
+              handle.write(f"version={version}\n")
+              handle.write(f"addon_id={addon_id}\n")
+              handle.write(f"tag={tag}\n")
+          PY
+
+      - name: Sync manifest with metadata
+        run: python tools/release.py sync
+
+      - name: Build addon zip
+        run: python tools/build_release_zip.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-addon-${{ steps.meta.outputs.version }}
+          path: dist/*.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.addon_id }} ${{ steps.meta.outputs.version }}
+          files: dist/*.zip
+          generate_release_notes: true
