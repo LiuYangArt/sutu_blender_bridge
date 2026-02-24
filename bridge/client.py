@@ -267,6 +267,8 @@ class BridgeClient:
                 self._set_error(E_SOCKET_IO, f"bridge 未知错误: {exc}")
             finally:
                 self._close_socket()
+                # Drop stale frames/messages from previous session before reconnect.
+                self._clear_send_queue()
 
             if self._stop_event.is_set():
                 break
@@ -382,7 +384,7 @@ class BridgeClient:
                 code = str(error_payload.get("code") or E_PROTO_MISMATCH)
                 text = str(error_payload.get("message") or "服务端错误")
                 self._set_error(code, text)
-                continue
+                raise BridgeClientError(code, f"Sutu runtime error: {text}")
         return last_peer_heartbeat
 
     def _read_control_message_until(

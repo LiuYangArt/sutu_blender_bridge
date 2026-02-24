@@ -255,6 +255,20 @@ def build_frame_meta(
     chunk_size: Optional[int] = None,
     pixel_format: str = "rgba8",
 ) -> ControlMessage:
+    normalized_transport = _normalize_transport_value(transport)
+    if normalized_transport == BRIDGE_TRANSPORT_SHM:
+        if shm_slot is None:
+            raise ValueError("shm transport requires shm_slot")
+        if chunk_size is not None:
+            raise ValueError("shm transport must set chunk_size=None")
+    elif normalized_transport == BRIDGE_TRANSPORT_TCP_LZ4:
+        if chunk_size is None or int(chunk_size) <= 0:
+            raise ValueError("tcp_lz4 transport requires chunk_size > 0")
+        if shm_slot is not None:
+            raise ValueError("tcp_lz4 transport must set shm_slot=None")
+    else:
+        raise ValueError(f"unsupported transport: {transport}")
+
     return {
         "type": MESSAGE_TYPE_FRAME_META,
         "payload": {
@@ -263,7 +277,7 @@ def build_frame_meta(
             "height": int(height),
             "stride": int(stride),
             "pixelFormat": pixel_format,
-            "transport": transport,
+            "transport": normalized_transport,
             "shmSlot": int(shm_slot) if shm_slot is not None else None,
             "chunkSize": int(chunk_size) if chunk_size is not None else None,
             "timestampMs": int(timestamp_ms),

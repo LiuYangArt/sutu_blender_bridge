@@ -3,6 +3,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
+from dataclasses import dataclass
 from typing import Optional
 
 try:
@@ -19,9 +21,17 @@ from .messages import (
     build_stop_stream,
     now_millis,
 )
-from .shm_ring import SharedMemoryRing, default_ring_name
+from .shm_ring import SHM_HEADER_BYTES, SharedMemoryRing, default_ring_name
 
-DEFAULT_RING_SLOTS = 3
+DEFAULT_RING_SLOTS = 4
+RETIRED_RING_TTL_SEC = 2.0
+
+
+@dataclass
+class _RetiredRing:
+    ring: SharedMemoryRing
+    expires_at: float
+    name: str
 
 
 class FrameSender:
@@ -29,13 +39,14 @@ class FrameSender:
         from .client import get_bridge_client
 
         self._client = client or get_bridge_client()
-        self._ring_slots = max(1, int(ring_slots))
+        self._ring_slots = DEFAULT_RING_SLOTS
         self._lock = threading.Lock()
         self._frame_id = 0
         self._streaming = False
         self._shm_ring: Optional[SharedMemoryRing] = None
         self._last_ring_name: Optional[str] = None
         self._last_ring_size: Optional[int] = None
+        self._retired_rings: list[_RetiredRing] = []
         self._warned_missing_lz4 = False
         self._tried_auto_install_lz4 = False
         self._auto_install_lz4 = True
@@ -101,7 +112,16 @@ class FrameSender:
             },
         )
         if transport == BRIDGE_TRANSPORT_SHM:
-            slot = self._write_frame_to_shm(payload, required_len)
+            slot = self._write_frame_to_shm(
+                payload=payload,
+                required_len=required_len,
+                frame_id=frame_id,
+                timestamp_ms=ts_ms,
+            )
+            print(
+                f"[SutuBridge] shm frame_meta frame_id={frame_id} slot={slot} "
+                f"w={width} h={height} stride={stride} ring={self._last_ring_name}"
+            )
             self._client.enqueue_control_message(
                 build_frame_meta(
                     frame_id=frame_id,
@@ -146,31 +166,82 @@ class FrameSender:
         self._client.enqueue_binary_chunk(compressed, frame_id=frame_id)
         return frame_id
 
-    def _write_frame_to_shm(self, payload: bytes, required_len: int) -> int:
-        ring_name = default_ring_name(self._client.port)
+    def _write_frame_to_shm(
+        self,
+        payload: bytes,
+        required_len: int,
+        frame_id: int,
+        timestamp_ms: int,
+    ) -> int:
+        self._cleanup_retired_rings()
+        slot_size = SHM_HEADER_BYTES + required_len
+        ring_name = default_ring_name(self._client.port, slot_size)
         if (
             self._shm_ring is None
             or self._last_ring_name != ring_name
-            or self._last_ring_size != required_len
+            or self._last_ring_size != slot_size
         ):
-            self._close_shm_ring()
+            self._retire_active_ring()
             self._shm_ring = SharedMemoryRing(
                 name=ring_name,
                 slot_count=self._ring_slots,
-                slot_size=required_len,
+                slot_size=slot_size,
                 create=True,
             )
             self._last_ring_name = ring_name
-            self._last_ring_size = required_len
-        return self._shm_ring.write_next(payload)
+            self._last_ring_size = slot_size
+            print(
+                f"[SutuBridge] shm ring ready name={ring_name} slot_count={self._ring_slots} slot_size={slot_size}"
+            )
+        return self._shm_ring.write_next(payload, frame_id=frame_id, timestamp_ms=timestamp_ms)
 
     def _close_shm_ring(self) -> None:
+        if self._shm_ring is not None:
+            try:
+                self._shm_ring.close(unlink=True)
+            except Exception as exc:
+                print(f"[SutuBridge] close shm ring failed: {exc}")
+            self._shm_ring = None
+            self._last_ring_name = None
+            self._last_ring_size = None
+
+        if self._retired_rings:
+            for retired in self._retired_rings:
+                try:
+                    retired.ring.close(unlink=True)
+                except Exception as exc:
+                    print(f"[SutuBridge] close retired shm ring failed name={retired.name}: {exc}")
+            self._retired_rings.clear()
+
+    def _retire_active_ring(self) -> None:
         if self._shm_ring is None:
             return
-        self._shm_ring.close(unlink=True)
+        retired_name = self._last_ring_name or self._shm_ring.name
+        # Keep old ring alive for a short grace period so peer can still attach
+        # to in-flight frame_meta that was queued before resize/stride change.
+        expires_at = time.monotonic() + RETIRED_RING_TTL_SEC
+        self._retired_rings.append(
+            _RetiredRing(ring=self._shm_ring, expires_at=expires_at, name=retired_name)
+        )
+        print(f"[SutuBridge] shm ring retired name={retired_name}, keep_alive={RETIRED_RING_TTL_SEC:.1f}s")
         self._shm_ring = None
         self._last_ring_name = None
         self._last_ring_size = None
+
+    def _cleanup_retired_rings(self) -> None:
+        if not self._retired_rings:
+            return
+        now = time.monotonic()
+        keep: list[_RetiredRing] = []
+        for retired in self._retired_rings:
+            if now < retired.expires_at:
+                keep.append(retired)
+                continue
+            try:
+                retired.ring.close(unlink=True)
+            except Exception as exc:
+                print(f"[SutuBridge] cleanup retired shm ring failed name={retired.name}: {exc}")
+        self._retired_rings = keep
 
     def _compress_tcp_payload(self, payload: bytes) -> bytes:
         self._maybe_auto_install_lz4()
