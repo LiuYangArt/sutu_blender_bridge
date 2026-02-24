@@ -8,7 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import bpy
 
@@ -72,6 +72,8 @@ class BridgeClient:
         self._session_counter = 0
         self._active_session_id: Optional[int] = None
         self._last_error: Optional[Dict[str, str]] = None
+        self._target_stream_width: Optional[int] = None
+        self._target_stream_height: Optional[int] = None
 
         self._socket_lock = threading.Lock()
         self._socket: Optional[socket.socket] = None
@@ -111,8 +113,14 @@ class BridgeClient:
                 "session_id": self._active_session_id,
                 "inflight_frames": len(self._inflight_frame_ids),
                 "max_inflight_frames": self._max_inflight_frames,
+                "target_stream_width": self._target_stream_width,
+                "target_stream_height": self._target_stream_height,
                 "last_error": dict(self._last_error) if self._last_error else None,
             }
+
+    def get_stream_target_size_hint(self) -> Tuple[Optional[int], Optional[int]]:
+        with self._state_lock:
+            return self._target_stream_width, self._target_stream_height
 
     def configure(self, link_mode: str, port: int, enable_connection: bool) -> bool:
         normalized_mode = BRIDGE_MODE_AUTO if link_mode == BRIDGE_MODE_AUTO else BRIDGE_MODE_MANUAL
@@ -158,6 +166,8 @@ class BridgeClient:
             self._degraded = False
             self._active_session_id = None
             self._inflight_frame_ids.clear()
+            self._target_stream_width = None
+            self._target_stream_height = None
         self._stop_worker()
 
     def shutdown(self) -> None:
@@ -328,6 +338,8 @@ class BridgeClient:
             self._degraded = degraded
             self._state = "streaming"
             self._inflight_frame_ids.clear()
+            self._target_stream_width = None
+            self._target_stream_height = None
 
         last_peer_heartbeat = time.monotonic()
         last_sent_heartbeat = 0.0
@@ -372,6 +384,11 @@ class BridgeClient:
             message_type = message.get("type")
             if message_type == MESSAGE_TYPE_HEARTBEAT:
                 last_peer_heartbeat = time.monotonic()
+                heartbeat_payload = expect_message_type(message, MESSAGE_TYPE_HEARTBEAT)
+                self._update_stream_target_hint(
+                    heartbeat_payload.get("targetWidth"),
+                    heartbeat_payload.get("targetHeight"),
+                )
                 continue
             if message_type == MESSAGE_TYPE_ACK:
                 ack_payload = expect_message_type(message, MESSAGE_TYPE_ACK)
@@ -446,6 +463,33 @@ class BridgeClient:
                 self._degraded = False
                 self._active_session_id = None
                 self._inflight_frame_ids.clear()
+                self._target_stream_width = None
+                self._target_stream_height = None
+
+    def _update_stream_target_hint(self, target_width: Any, target_height: Any) -> None:
+        next_width = _normalize_optional_positive_int(target_width)
+        next_height = _normalize_optional_positive_int(target_height)
+
+        with self._state_lock:
+            prev = (self._target_stream_width, self._target_stream_height)
+            curr = (next_width, next_height)
+            if prev == curr:
+                return
+            self._target_stream_width, self._target_stream_height = curr
+
+        print(
+            "[SutuBridge] stream target hint updated "
+            f"{prev[0]}x{prev[1]} -> {curr[0]}x{curr[1]}"
+        )
+
+
+def _normalize_optional_positive_int(value: Any) -> Optional[int]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        return None
+    return parsed
 
     def _set_error(self, code: str, message: str) -> None:
         with self._state_lock:

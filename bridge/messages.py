@@ -73,7 +73,7 @@ _PAYLOAD_FIELDS_BY_TYPE = {
     ),
     MESSAGE_TYPE_ACK: ("frameId",),
     MESSAGE_TYPE_ERROR: ("code", "message"),
-    MESSAGE_TYPE_HEARTBEAT: ("timestampMs",),
+    MESSAGE_TYPE_HEARTBEAT: ("timestampMs", "targetWidth", "targetHeight"),
 }
 
 
@@ -304,11 +304,17 @@ def build_error(code: str, message: str) -> ControlMessage:
     }
 
 
-def build_heartbeat(timestamp_ms: Optional[int] = None) -> ControlMessage:
+def build_heartbeat(
+    timestamp_ms: Optional[int] = None,
+    target_width: Optional[int] = None,
+    target_height: Optional[int] = None,
+) -> ControlMessage:
     return {
         "type": MESSAGE_TYPE_HEARTBEAT,
         "payload": {
             "timestampMs": int(timestamp_ms if timestamp_ms is not None else now_millis()),
+            "targetWidth": int(target_width) if target_width is not None else None,
+            "targetHeight": int(target_height) if target_height is not None else None,
         },
     }
 

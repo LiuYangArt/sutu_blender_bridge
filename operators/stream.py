@@ -28,12 +28,25 @@ _OFFSCREEN = None
 _OFFSCREEN_SIZE = (0, 0)
 _CAPTURE_BACKEND = None
 _OFFSCREEN_LAYOUT_LOGGED = False
+_DOWNSCALE_LOG_SIGNATURE = None
+_DOWNSCALE_INDEX_CACHE = {}
+_WAITING_HINT_LOGGED = False
 
 
 def _as_optional_int(value):
     if value is None:
         return None
     return int(value)
+
+
+def _as_positive_int(value):
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _iter_view3d_window_regions():
@@ -130,6 +143,23 @@ def _on_depsgraph_update(scene, depsgraph) -> None:
     _mark_stream_dirty()
 
 
+def _get_stream_target_hint() -> tuple[int | None, int | None]:
+    hint_width_raw, hint_height_raw = get_bridge_client().get_stream_target_size_hint()
+    return _as_positive_int(hint_width_raw), _as_positive_int(hint_height_raw)
+
+
+def _ensure_stream_target_hint_ready() -> bool:
+    global _WAITING_HINT_LOGGED
+    hint_width, hint_height = _get_stream_target_hint()
+    if hint_width is not None and hint_height is not None:
+        _WAITING_HINT_LOGGED = False
+        return True
+    if not _WAITING_HINT_LOGGED:
+        _WAITING_HINT_LOGGED = True
+        print("[SutuBridge] waiting stream target hint from Sutu before first frame")
+    return False
+
+
 def _stream_state_timer():
     global _LAST_VIEW_SIGNATURE
 
@@ -150,6 +180,8 @@ def _stream_state_timer():
 
     now = time.monotonic()
     if _PENDING_CAPTURE:
+        if not _ensure_stream_target_hint_ready():
+            return STATE_POLL_INTERVAL_SEC
         _tag_stream_regions_redraw()
         return REDRAW_RETRY_INTERVAL_SEC
 
@@ -177,6 +209,9 @@ def _capture_draw_callback():
     if not _PENDING_CAPTURE:
         return
 
+    if not _ensure_stream_target_hint_ready():
+        return
+
     region = getattr(bpy.context, "region", None)
     if region is None or region.type != "WINDOW":
         return
@@ -194,6 +229,7 @@ def _capture_draw_callback():
             pixels = _capture_best_color_bytes(frame_buffer, width, height)
         if pixels is None:
             return
+        width, height, pixels = _downscale_for_stream(width, height, pixels)
         sender.send_rgba_frame(width=width, height=height, pixels=pixels)
         _LAST_CAPTURE_AT = time.monotonic()
         _PENDING_CAPTURE = False
@@ -482,6 +518,67 @@ def _capture_best_color_bytes(frame_buffer, width: int, height: int):
     return best_pixels
 
 
+def _target_stream_size(width: int, height: int) -> tuple[int, int]:
+    hint_width, hint_height = _get_stream_target_hint()
+
+    width_limit = width
+    height_limit = height
+    if hint_width is not None:
+        width_limit = min(width_limit, hint_width)
+    if hint_height is not None:
+        height_limit = min(height_limit, hint_height)
+
+    if width_limit <= 0 or height_limit <= 0:
+        return width, height
+
+    scale = min(1.0, float(width_limit) / float(width), float(height_limit) / float(height))
+    if scale >= 0.9999:
+        return width, height
+    target_width = max(1, int(round(width * scale)))
+    target_height = max(1, int(round(height * scale)))
+    return target_width, target_height
+
+
+def _downscale_for_stream(width: int, height: int, pixels: bytes) -> tuple[int, int, bytes]:
+    global _DOWNSCALE_LOG_SIGNATURE
+    if np is None:
+        return width, height, pixels
+
+    target_width, target_height = _target_stream_size(width, height)
+    if target_width == width and target_height == height:
+        return width, height, pixels
+
+    expected = width * height * 4
+    if len(pixels) < expected:
+        return width, height, pixels
+    try:
+        frame = np.frombuffer(pixels, dtype=np.uint8).reshape(height, width, 4)
+        cache_key = (width, height, target_width, target_height)
+        index_pair = _DOWNSCALE_INDEX_CACHE.get(cache_key)
+        if index_pair is None:
+            x_idx = (np.arange(target_width, dtype=np.int32) * width) // target_width
+            y_idx = (np.arange(target_height, dtype=np.int32) * height) // target_height
+            index_pair = (x_idx, y_idx)
+            _DOWNSCALE_INDEX_CACHE[cache_key] = index_pair
+            if len(_DOWNSCALE_INDEX_CACHE) > 8:
+                _DOWNSCALE_INDEX_CACHE.clear()
+                _DOWNSCALE_INDEX_CACHE[cache_key] = index_pair
+        x_idx, y_idx = index_pair
+        downscaled = np.ascontiguousarray(frame[y_idx[:, None], x_idx[None, :], :])
+        log_signature = (width, height, target_width, target_height)
+        if _DOWNSCALE_LOG_SIGNATURE != log_signature:
+            _DOWNSCALE_LOG_SIGNATURE = log_signature
+            hint_width, hint_height = _get_stream_target_hint()
+            print(
+                "[SutuBridge] stream downscale "
+                f"{width}x{height} -> {target_width}x{target_height} "
+                f"(hint={hint_width}x{hint_height})"
+            )
+        return target_width, target_height, downscaled.tobytes()
+    except Exception:
+        return width, height, pixels
+
+
 def _ensure_stream_hooks() -> None:
     global _DRAW_HANDLER, _DEPSGRAPH_HANDLER
     if _DRAW_HANDLER is None:
@@ -525,6 +622,9 @@ def _reset_stream_state() -> None:
     global _CAPTURE_COLOR_SLOT
     global _CAPTURE_BACKEND
     global _OFFSCREEN_LAYOUT_LOGGED
+    global _DOWNSCALE_LOG_SIGNATURE
+    global _DOWNSCALE_INDEX_CACHE
+    global _WAITING_HINT_LOGGED
     _LAST_CAPTURE_AT = 0.0
     _LAST_DIRTY_AT = 0.0
     _PENDING_CAPTURE = False
@@ -532,6 +632,9 @@ def _reset_stream_state() -> None:
     _CAPTURE_COLOR_SLOT = None
     _CAPTURE_BACKEND = None
     _OFFSCREEN_LAYOUT_LOGGED = False
+    _DOWNSCALE_LOG_SIGNATURE = None
+    _DOWNSCALE_INDEX_CACHE = {}
+    _WAITING_HINT_LOGGED = False
     _free_offscreen()
 
 
